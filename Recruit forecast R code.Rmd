@@ -1,0 +1,571 @@
+---
+title: "Recruit Restaurant Visitors Forecast"
+author: "Siva Tejaswini Kandimalla"
+date: "10/17/2019"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+##1. Introduction
+
+Running a local restaurant isn't always as charming as first impressions appear. Often there are many unexpected troubles popping up that could hurt business.
+Thus, Demand forecasting is one of the important inputs for a successful restaurant yield and revenue management system.  Forecasting the number of visitors helps the restaurant management to optimise their resources and reduce wastage. Prior information of demand also helps in avoiding unexpected shortages and be much more efficient, allowing them to focus on creating an enjoyable dining experience for their customers. 
+However, this forecast isn’t easy to make because many unpredictable factors affect restaurant attendance, like weather and local competition. It's even harder for newer restaurants with little historical data.
+Recruit Holdings has unique access to key datasets that could make automated future customer prediction possible. I utilize this Kaggle competition dataset to forecast a model for predicting the number of future visitors. 
+
+```{r setup, include=FALSE}
+pacman::p_load(ggplot2, scales, grid, dplyr, readr, shiny, data.table, tibble, tidyr, stringr, forcats, tseries, forecast, maps, leaflet, geosphere, fpp2, timetk, plotly, imputeTS, timeDate, timetk, fpp2,tidyverse, shinycssloaders, htmltools, lubridate)
+theme_set(theme_classic())
+
+library('ggplot2')
+library('scales')
+library('grid')
+library('dplyr')
+library('readr')
+library('tibble')
+library('forcats')
+library('timeDate')
+library('tseries')
+library('timetk')
+library('fpp2')
+library('shiny')
+library('tidyverse')
+library('tm')
+library('lubridate')
+library('data.table')
+library('tidyr')
+library('stringr')
+library('forecast')
+library('leaflet')
+library('plotly')
+library('gridExtra')
+library('htmltools')
+library('shinycssloaders')
+
+```
+
+
+##2. About Dataset
+This is a time series data of Japanese restaurants obtained from two sources: ‘Hot Pepper Gourmet (hpg)’ and ‘AirREGI/Restaurant Board (air).
+Training data is given for reservations and visits from 2016 until April 2017. 
+Test set contains Last week of April and May 2017. It is subset of air restaurants and spans a holiday week.The dataset provided has 8 excel files, namely air_visits, air_reserve,  hpg_reserve, air_store_info, hpg_store_info,date_info,store_id_realtion,sample_submission.
+## Box Folder Link
+The link to the box folder for shared files is: https://utdallas.box.com/s/9gaw4uqcwkk7bhoo6xiys7fwjyl6vlxq
+
+
+```{r}
+air_visits <- as.tibble(fread(str_c('air_visit_data.csv')))
+air_reserve <- as.tibble(fread(str_c('air_reserve.csv')))
+hpg_reserve <- as.tibble(fread(str_c('hpg_reserve.csv')))
+air_store <- as.tibble(fread(str_c('air_store_info.csv')))
+hpg_store <- as.tibble(fread(str_c('hpg_store_info.csv')))
+holidays <- as.tibble(fread(str_c('date_info.csv')))
+store_ids <- as.tibble(fread(str_c('store_id_relation.csv')))
+test <- as.tibble(fread(str_c('sample_submission.csv')))
+```
+
+
+
+   
+```{r}
+# Simple Feature Engineering: Converting the timestamp of visit and reservation data into their respective date, time formats. Also combining holiday info and extracting latitude and longitude for plot in R Shiny.
+
+air_visits <- air_visits %>%
+  mutate(visit_date = ymd(visit_date))
+
+air_reserve <- air_reserve %>%
+  mutate(visit_datetime = ymd_hms(visit_datetime),
+         reserve_datetime = ymd_hms(reserve_datetime))
+
+hpg_reserve <- hpg_reserve %>%
+  mutate(visit_datetime = ymd_hms(visit_datetime),
+         reserve_datetime = ymd_hms(reserve_datetime))
+
+air_store <- air_store %>%
+  mutate(air_genre_name = as.factor(air_genre_name),
+         air_area_name = as.factor(air_area_name))
+
+hpg_store <- hpg_store %>%
+  mutate(hpg_genre_name = as.factor(hpg_genre_name),
+         hpg_area_name = as.factor(hpg_area_name))
+
+holidays <- holidays %>%
+  mutate(holiday_flg = as.logical(holiday_flg),
+         date = ymd(calendar_date))
+
+# Joining Air_visits Data and Air_Store data
+data <- air_visits %>%
+  left_join(air_store, by = "air_store_id")
+
+data  %>% separate(air_area_name, c("prefecture"), sep = " ", remove = FALSE) -> data
+data %>% distinct(air_genre_name) %>% nrow()
+data %>% distinct(air_area_name) %>% nrow()
+data %>% distinct(prefecture) %>% nrow()
+data %>% distinct(prefecture,air_genre_name) %>% nrow()
+data %>% distinct(prefecture,air_genre_name) -> distinct_area_gener
+
+data <- data %>%
+  mutate(calendar_date = as.character(visit_date)) %>%
+  left_join(holidays, by = "calendar_date")
+
+data$holiday_flg = as.numeric(data$holiday_flg)
+
+data = subset(data, select = -c(date,calendar_date))
+data = subset(data, select = -c(latitude,longitude))
+
+```
+
+## 3. Understanding the Data
+Overall there are 829 unique restaurants that we need to forecast the number of future visitors. Among these, only 314 have the reservation information. Though HPG Air have information of 13000 restaurants,only 150 of those are there in Air regi system. Similarly store information of many restaurants are provided which is not required. So we will use the air_visits data primarily for our forecasting.
+
+
+```{r echo=FALSE}
+n_reserve <- air_reserve %>% distinct(air_store_id) %>% count()
+print(paste("air_reserve contains reservation info of", n_reserve, "stores", sep=" "))
+
+n_visit <- air_visits %>% distinct(air_store_id) %>% count()
+print(paste("air_visit contains actual visitors info of", n_visit, "stores", sep=" "))
+
+air_info <- air_store %>% distinct(air_store_id) %>% count()
+print(paste("air_store_info contains actual visitors info of", air_info, "stores", sep=" "))
+
+hpg_n_reserve <-hpg_reserve %>% distinct(hpg_store_id) %>% count()
+hpg_air_reserve <- air_store %>% 
+  left_join(store_ids, c("air_store_id")) %>% 
+  left_join(hpg_reserve, c("hpg_store_id")) %>% na.omit() %>% 
+distinct(hpg_store_id) %>% count()
+
+print(paste("hpg_reserve contains reservation info of", hpg_n_reserve, "stores but only",hpg_air_reserve, "belongs to the AirREGI system", sep=" "))
+
+hpg_info <- hpg_store %>% distinct(hpg_store_id) %>% count()
+hpg_air_info <- air_store %>% 
+  left_join(store_ids, c("air_store_id")) %>% 
+  left_join(hpg_store, c("hpg_store_id")) %>% na.omit() %>% 
+distinct(hpg_store_id) %>% count()
+
+print(paste("hpg_store_info contains reservation info of", hpg_info, "stores but only",hpg_air_info, "belongs to the AirREGI system", sep=" "))
+```
+
+## 5. Exploratory Data Analysis 
+
+## A. Famous Restaurant genres
+
+Genres for both the Air and HPG restaurants are ranked based on the number of visitors to these restaurants. It can be seen that Izakaya/Japanese style is the top rated genre which visitors prefer. However there are dissimilarities in the ranking of other genres when compared. For example, cafe sweets is ranked 2nd by number of Air visitors but International cuisine is second most prefered by hpg visitors. This indicates that the restaurant categories are not in sync which otherwise they should be.
+
+```{r fig.width=15, fig.height=7, echo=FALSE}
+p1 <- air_store %>% 
+  left_join(air_visits, c("air_store_id")) %>%
+  dplyr::group_by(air_genre_name) %>% 
+  dplyr::summarize(act_visitor_tol = sum(visitors)) %>%
+  ggplot() +
+  geom_bar(aes(x=reorder(air_genre_name,act_visitor_tol),
+                         y=act_visitor_tol), stat='identity', fill='#1A5887') +
+  labs(x="air_genre", title="Visitors by Air Restaurant Genre") +
+  guides(fill=FALSE) +
+  coord_flip() +
+  theme(axis.text=element_text(size=14), 
+                 axis.text.x=element_text(size=14),
+                 axis.text.y=element_text(size=14),
+                 plot.title = element_text(size=20),
+                axis.title=element_text(size=17))
+  
+p2 <- air_store %>% 
+  left_join(air_visits, c("air_store_id")) %>%
+  left_join(store_ids, c("air_store_id")) %>% 
+  left_join(hpg_store, c("hpg_store_id")) %>% 
+  dplyr::group_by(hpg_genre_name) %>% 
+  dplyr::summarize(act_visitor_tol = sum(visitors)) %>%
+  na.omit() %>% 
+  ggplot() +
+  geom_bar(aes(x=reorder(hpg_genre_name, act_visitor_tol),
+                         y=act_visitor_tol), stat='identity',fill="#C70509") +
+  labs(x="hpg_genre", title="Visitors by HPG Restaurant Genre") +
+  guides(fill=FALSE) +
+  coord_flip()  +
+  theme(axis.text=element_text(size=14), 
+                 axis.text.x=element_text(size=14),
+                 axis.text.y=element_text(size=14),
+                 plot.title = element_text(size=20),
+                axis.title=element_text(size=17)) 
+
+grid.arrange(p1,p2,ncol=2)
+```
+
+
+##B. Time series analysis of actual Air visitors
+
+As the restuarnt data is only for 16 months, we cannot identify any particular cyclicity or trend in the time series plot. There is presence of weakly seasonality which can be shown in the next graphs.
+plot1: We observe a sudden spike in the number of total visitors from the time series graph. It indicates that new restaurants might have opened during July of 2016. 
+plot2: The median number of air visitors is around 18. Addition of new restaurants did not have any effect in the median number of visitors.
+```{r}
+# EDA of Air_Visits:
+p1 <- air_visits %>%
+  group_by(visit_date) %>%
+  summarise(all_visitors = sum(visitors)) %>%
+  ggplot(aes(visit_date,all_visitors)) +
+  geom_line(col = 'blue') +
+  labs(y = "All visitors", x = "Date",title="Time series of total air_visitors")
+
+
+p2 <- air_visits %>%
+  group_by(visit_date) %>%
+  summarise(all_visitors = median(visitors)) %>%
+  ggplot(aes(visit_date,all_visitors)) +
+  geom_line(col = 'purple') +
+  labs(y = "Median visitors", x = "Date",title="Time series of median air_visitors")
+
+grid.arrange(p1,p2,nrow=2)
+```
+## C. Frequency of visits by Month and Day
+plot1: It can be seen that the number of air visitors is high during weekends compared to weekdays which is as expected. Saturday has the highest number of visitors followed be Sunday and Friday.Monday and Tuesday have the least number of visitors. 
+plot2: December has the highest nuber of visitors as it is a holiday season. Months of March- May also have high floating of customers in restaurants.
+
+```{r}
+
+p1 <- air_visits %>%
+  mutate(wday = wday(visit_date, label = TRUE)) %>%
+  group_by(wday) %>%
+  summarise(visits = median(visitors)) %>%
+  ggplot(aes(wday, visits )) +
+  geom_col(fill = 'blue') +
+  theme(legend.position = "none", axis.text.x  = element_text(angle=45, hjust=1, vjust=0.9)) +
+  labs(x = "Day of the week", y = "Median visitors",title=" Number of air_visitors by week day")
+
+
+p2 <- air_visits %>%
+  mutate(month = month(visit_date, label = TRUE)) %>%
+  group_by(month) %>%
+  summarise(visits = median(visitors)) %>%
+  ggplot(aes(month, visits)) +
+  geom_col(fill = 'purple') +
+  theme(legend.position = "none") +
+  labs(x = "Month", y = "Median visitors",title=" Number of air_visitors by month")
+grid.arrange(p1,p2,ncol=2)
+
+```
+## D. Air Reserved Visitors:
+Plot1: The time series graph for the number of reservations is literally flat during the months of August and september indicating there was some issue with the server system.  
+
+It can be seen that the proportion of reservations to the actual visits is pretty low, between 10-30% on average.
+
+Also there is a significant increase in the number of reservations after september 2016 when compared to before July 2016. This is an interesting perspective to note. It can be accounted to the opening of new restaurants during July 2016 as shown earlier.
+
+Plot2: The number of visitors is high during evening with most reservations being made during 6pm. Compared to the reservations in evening and night, morning and noon times have very less number of visitors.
+
+Plot3: Similar to the number of visitors reservations are made at large number during weekends.
+
+  
+```{r}
+# Air Reserve
+
+foo <- air_reserve %>%
+  mutate(reserve_date = date(reserve_datetime),
+         reserve_hour = hour(reserve_datetime),
+         reserve_wday = wday(reserve_datetime, label = TRUE),
+         visit_date = date(visit_datetime),
+         visit_hour = hour(visit_datetime),
+         visit_wday = wday(visit_datetime, label = TRUE),
+         diff_hour = time_length(visit_datetime - reserve_datetime, unit = "hour"),
+         diff_day = time_length(visit_datetime - reserve_datetime, unit = "day")
+  )
+
+p1 <-foo %>%
+  group_by(visit_date) %>%
+  summarise(all_reserve_visitors = sum(reserve_visitors)) %>%
+  ggplot(aes(visit_date, all_reserve_visitors)) +
+  geom_line(col='blue') +
+  labs(x = "'air' visit date",title="Time series plot of air_reservations")
+
+
+p2 <- foo %>%
+  group_by(visit_hour) %>%
+  summarise(all_reserve_visitors = sum(reserve_visitors)) %>%
+  ggplot(aes( x= visit_hour, y = all_reserve_visitors)) +
+  geom_col(fill ='blue')+
+  labs(title=" Hourly plot of vistors")
+
+
+p3 <- foo %>%
+  group_by(visit_wday) %>%
+  summarise(all_reserve_visitors = sum(reserve_visitors)) %>%
+  ggplot(aes(x= visit_wday, y = all_reserve_visitors)) +
+  geom_col(fill = 'purple')+
+  labs(title=" Weekly plot of visitors")
+grid.arrange(p1,grid.arrange(p2,p3,ncol=2), nrow=2)
+```
+##E. HPG reserves data analysis
+
+The time series graph for hpg reservations has a sudden spike during New year. The frequency of reservations by hour and month and week day is similar to what we saw before.
+```{r}
+
+# HPG Reserve
+
+foo <- hpg_reserve %>%
+  mutate(reserve_date = date(reserve_datetime),
+         reserve_hour = hour(reserve_datetime),
+         visit_date = date(visit_datetime),
+         visit_hour = hour(visit_datetime),
+         visit_wday = wday(visit_datetime, label = TRUE),
+         diff_hour = time_length(visit_datetime - reserve_datetime, unit = "hour"),
+         diff_day = time_length(visit_datetime - reserve_datetime, unit = "day")
+  )
+
+
+p1 <- foo %>%
+  group_by(visit_date) %>%
+  summarise(all_reserve_visitors = sum(reserve_visitors)) %>%
+  ggplot(aes(visit_date, all_reserve_visitors)) +
+  geom_line(col='blue') +
+ labs(x ="date" ,y ="hpg_visitors_total", title = 'Time series plot for HPG visitors')
+
+
+p2 <- foo %>%
+  group_by(visit_hour) %>%
+  summarise(all_reserve_visitors = sum(reserve_visitors)) %>%
+  ggplot(aes(visit_hour, all_reserve_visitors)) +
+  geom_col(fill = 'blue')+
+  labs(x ="visit hour" ,y ="hpg_visitors_total", title = 'plot for HPG visitors by hour')
+
+
+p3 <- foo %>%
+  group_by(visit_wday) %>%
+  summarise(all_reserve_visitors = sum(reserve_visitors)) %>%
+  ggplot(aes(visit_wday, all_reserve_visitors)) +
+  geom_col(fill = 'purple')+
+  labs(x ="visit day" ,y ="hpg_visitors_total", title = 'plot for HPG visitors by day')
+
+grid.arrange(p1,grid.arrange(p2,p3,ncol=2), nrow=2)
+```
+##F. Holidays Info
+
+From the bar chart plot, the number of holiday days is very less compared to working days.
+The box plot shows that the median number of visitors during holidays and non holidays is almost same. However the maximum number of visitors during work days is very high compared to holidays which can be seen from the number of outliers.
+
+```{r}
+
+# Date Info
+foo <- holidays %>%
+  mutate(wday = wday(date))
+
+p1 <- foo %>%
+  ggplot(aes(holiday_flg)) +
+  geom_bar(fill = 'purple') +
+  theme(legend.position = "none")+
+  labs(title ='bar chart for holidays')
+
+
+foo <- air_visits %>%
+  mutate(calendar_date = as.character(visit_date)) %>%
+  left_join(holidays, by = "calendar_date")
+
+p2 <- foo %>%
+  ggplot(aes(holiday_flg, visitors)) +
+  geom_boxplot( fill ='blue') +
+  scale_y_log10() +
+  theme(legend.position = "none")+
+  labs(title = 'box plot of holidays')
+grid.arrange(p1,p2,ncol=2)
+
+
+```
+## 6. Data Processing
+Time Series Data is prepared with Feature Engineering for ARIMA, ETS and HolWinters models
+As there NA values in time series data of restaurants, I have imputed the missing values with the median number of visitors that restaurant had on each particular day of the week (i.e. Monday or Tuesday or Wednesday, etc.)
+for developing models data is split into train and validation set. Only 39 observations are kept in the validation set to make it similar to the test set.
+
+```{r}
+#Creating Time Series Data with Feature Engineering for ARIMA,ETS and HolWinters models
+# Visits data is merged with holidays info and  median value of data is found for each store ID by day of week and combined into a single data set.
+
+all_visits <- tibble(visit_date = seq(min(air_visits$visit_date), max(air_visits$visit_date), 1))
+
+holidays_2 = holidays %>% mutate(visit_date = date) 
+
+all_visits %>%
+  
+  left_join(holidays_2, by = "visit_date") -> all_visits
+
+all_visits = all_visits[,c('visit_date', 'day_of_week')]
+
+dist_air_store_id = air_visits %>% distinct(air_store_id)
+
+for (i in 1:829){
+  
+  air_id = as.character(dist_air_store_id[i,])
+  
+  foo <- air_visits %>%
+    filter(air_store_id == air_id)
+  
+  visits <- foo %>%
+    right_join(all_visits, by = "visit_date") %>% mutate(air_store_id = air_id)
+  
+  visits_left <- foo %>%
+    left_join(all_visits, by = "visit_date") %>% mutate(air_store_id = air_id)
+  
+  
+  Friday = visits %>%
+    filter(day_of_week == 'Friday') %>% 
+    replace_na(list(visitors = median(unlist(c((visits_left %>% filter(day_of_week == 'Friday'))[,'visitors'])))))
+  
+  
+  Saturday = visits %>%
+    
+    filter(day_of_week == 'Saturday') %>% 
+    replace_na(list(visitors = median(unlist(c((visits_left %>% filter(day_of_week == 'Saturday'))[,'visitors'])))))
+  
+  Sunday = visits %>%
+    
+    filter(day_of_week == 'Sunday') %>% 
+    replace_na(list(visitors = median(unlist(c((visits_left %>% filter(day_of_week == 'Sunday'))[,'visitors'])))))
+  
+  
+  
+  Monday = visits %>%
+    
+    filter(day_of_week == 'Monday') %>% 
+    replace_na(list(visitors = median(unlist(c((visits_left %>% filter(day_of_week == 'Monday'))[,'visitors'])))))
+  
+  Tuesday = visits %>%
+    
+    filter(day_of_week == 'Tuesday') %>% 
+    replace_na(list(visitors = median(unlist(c((visits_left %>% filter(day_of_week == 'Tuesday'))[,'visitors'])))))
+  
+  
+  Wednesday = visits %>%
+    
+    filter(day_of_week == 'Wednesday') %>% 
+    replace_na(list(visitors = median(unlist(c((visits_left %>% filter(day_of_week == 'Wednesday'))[,'visitors'])))))
+  
+  
+  Thursday = visits %>%
+    
+    filter(day_of_week == 'Thursday') %>% 
+    replace_na(list(visitors = median(unlist(c((visits_left %>% filter(day_of_week == 'Thursday'))[,'visitors'])))))
+  
+  
+  visits = rbind(Friday, Saturday,Sunday,Monday,Tuesday,Wednesday,Thursday)
+  visits = visits %>% arrange(visit_date)
+  visits = visits %>% 
+    replace_na(list(visitors = median(foo$visitors)))
+  
+  if (i==1){
+    cum_visits = visits
+  }else {
+    cum_visits = rbind(cum_visits, visits)
+  }
+}
+
+```
+
+## 7. Fitting the Forecasting models and finding RMSE values:
+## A. Arima model: 
+Auto Regressive Integrated Moving Average model is the general model in forecasting  time series data. Though Arima has three parameters p, d, q as building blocks, I have not considered the lags here as individually identifying the model for each unique store id (out of 829 distinct stores) would be complex. So I used auto.arima() model with stepwise = FALSE and approximation = FALSE to find out these parameters automatically and make the required forecast here.
+###Output:
+It is hard to run the model on each restaurant id as it consumes lot of time. So I have run only on 10 restaurants and got an RMSE of 8.33. As there is no autocorrelation in the data, (i.e. the past explains the present), ARIMA may not be a great forecasting model for this data.
+
+## B. Holt Winters Model:
+This is a special case of Arima model. It requires triple exponential smoothing and the data should be seasonal for this model to work well. AS the restaurant data has weekly seasonality, HoltWinters model can be used here for forecasting here.
+
+###Output:
+I have run this model on 10 restaurants and got an RMSE of 7.4
+It is clearly performing better than the simple arima model. However the optimisation criterion used in HoltWinters is different than what is used in ETS. HoltWinters() uses heuristic values for the initial states and then estimates the smoothing parameters by optimizing the MSE. 
+## B. ETS Model:
+As there is weekly seasonality in the time series data , exponential smoothing method (ETS) can be a better forecasting model for this data. It is also more reliable than HoltWinters as ets()estimates both the initial states and smoothing parameters by optimizing the likelihood function. So it gives better forescast than HolWinters which can be seen in thE RMSE value of the output.
+
+###Output: 
+This model is the best forecasting model of the above considered models. It gives the lowest RMSE of 7.1 when run on same set of 10 restaurants.
+
+###Note: 
+All these models take long time to execute. So only a subset of the restaurants are considered to calculate the RMSE of these models which again takes around 5 mins for execution.
+
+```{r}
+
+pred_len <- test %>%
+  
+  separate(id, c("air", "store_id", "date"), sep = "_") %>%
+  
+  distinct(date) %>%
+  
+  nrow()
+
+max_date <- max(air_visits$visit_date)
+
+split_date <- max_date - pred_len
+
+ETS_forecats_MSE = list()
+arima_forecats_MSE = list()
+HW_forecats_MSE = list()
+#a = Sys.time()
+for (i in 1:10){
+  air_id = as.character(dist_air_store_id[i,])
+  visits <- cum_visits %>%
+    
+    filter(air_store_id == air_id) %>%
+    
+    rownames_to_column()
+  
+  
+  visits_train <- visits %>% filter(visit_date <= split_date)
+  
+  visits_valid <- visits %>% filter(visit_date > split_date)
+  
+  
+  ETS.fit <- ets(tsclean(ts(visits_train$visitors, frequency = 7)))
+  ETS_visits <- ETS.fit %>% forecast(h = pred_len, level = c(95))
+  s1 = unlist(ETS_visits[2]) - visits_valid$visitors
+  ETS_forecats_MSE = c(ETS_forecats_MSE, unlist(sum(s1*s1)/pred_len))
+ 
+  
+  arima.fit <- auto.arima(tsclean(ts(visits_train$visitors, frequency = 7)),
+                          stepwise = FALSE, approximation = FALSE)
+  arima_visits <- arima.fit %>% forecast(h = pred_len, level = c(95))
+  s2 = unlist(arima_visits[4]) - visits_valid$visitors
+  arima_forecats_MSE = c(arima_forecats_MSE, unlist(sum(s2*s2)/pred_len))
+  
+  HW.fit <- HoltWinters(tsclean(ts(visits_train$visitors, frequency = 7)))
+  HW_visits <- HW.fit %>% forecast(h = pred_len, level = c(95))
+  s3 = unlist(HW_visits[4]) - visits_valid$visitors
+  HW_forecats_MSE = c(HW_forecats_MSE, unlist(sum(s3*s3)/pred_len))
+}
+
+arima_forecats_MSE = unlist(arima_forecats_MSE)
+arima_RMSE = (sum(arima_forecats_MSE)/i)^0.5
+arima_RMSE
+print(paste(" The RMSE value of ARIMA model is ", arima_RMSE))
+
+HW_forecats_MSE = unlist(HW_forecats_MSE)
+RMSE_HW = (sum(HW_forecats_MSE)/i)^0.5
+RMSE_HW
+print(paste(" The RMSE value of HoltWinters model is ", RMSE_HW))
+
+ETS_forecats_MSE = unlist(ETS_forecats_MSE)
+RMSE_ETS = (sum(ETS_forecats_MSE)/i)^0.5
+RMSE_ETS
+print(paste(" The RMSE value of ETS model is ", RMSE_ETS))
+
+```
+#8. R Shiny App
+
+I have created a R Siny App for initial Data Exploration and Forecasting models. I have used plotly library to create interactive models. The Shiny model consits of 4 tabs:
+
+## A. Basic EDA
+
+### I. Restaurant on Map
+I have plotted the location of restaurants using the latititude and longitude information and leaflet library. It contains input tab of 'Select Restaurant'. The exact location of the restaurant can be found at granular level by zooming or clicking on the cluster of restaurants. Each restaurant contains the information of its genre (legend). 
+
+### II. Time series visualisation of past visitors to restaurant
+
+The inputs are 'select restaurant' and 'range of dates'. The plot is interactive and contains information of total number of visitors on that day. The plot can be zoomed in to the level of details.
+
+### III: Median vistors to restaurant on different weekdays and months
+
+This graph is similar to what we have seen during our EDA.
+
+## B. Forecasting Models 
+The inputs are 'select restaurant' and 'select range of dates'
+The prediction of the model is shown in blue colour along with 95% confidence intervals for the forecast.
+A data table is created for each of the model with the forecast date, point value of forecast, lower and upper values of forecast for 95% confidence intervals as shown below.
+
+###Note: 
+The Shiny code is uploaded in the zip file with name 'Shinycode_Kandimalla'. It doesnt take time to run this file, but the forcasting models take time to load after selecting the dates (nearly 20 sec- 1 min).
